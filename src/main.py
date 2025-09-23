@@ -56,8 +56,9 @@ async def lifespan(app: FastAPI):
         logger.info("Успешно подключились к Elasticsearch")
         await metrics.increment("startup.elasticsearch.connection_success")
         
-        # Проверяем наличие .hbk файла и запускаем автоиндексацию
-        await auto_index_on_startup()
+        # Проверяем наличие .hbk файла и запускаем автоиндексацию в фоне,
+        # чтобы не блокировать обработку HTTP запросов во время парсинга
+        asyncio.create_task(auto_index_on_startup())
     
     await metrics.increment("startup.completed")
     
@@ -267,7 +268,8 @@ async def health_check():
             await es_client.connect()
         
         es_connected = await es_client.is_connected()
-        index_exists = await es_client.index_exists() if es_connected else False
+        index_exists_response = await es_client.index_exists() if es_connected else False
+        index_exists = bool(index_exists_response) if index_exists_response else False
         docs_count = await es_client.get_documents_count() if index_exists else None
     
     await metrics.increment("health_check.requests")
@@ -284,7 +286,8 @@ async def health_check():
 async def index_status():
     """Статус индексации."""
     es_connected = await es_client.is_connected()
-    index_exists = await es_client.index_exists() if es_connected else False
+    index_exists_response = await es_client.index_exists() if es_connected else False
+    index_exists = bool(index_exists_response) if index_exists_response else False
     docs_count = await es_client.get_documents_count() if index_exists else 0
     
     return {

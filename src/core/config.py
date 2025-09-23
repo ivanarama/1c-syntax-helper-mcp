@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     """Основные настройки приложения."""
     
     # Elasticsearch настройки
-    elasticsearch_host: str = "192.168.0.12"
+    elasticsearch_host: str = "elasticsearch"
     elasticsearch_port: str = "9200"
     elasticsearch_url: str = "http://localhost:9200"
     elasticsearch_index: str = "help1c_docs"
@@ -67,8 +67,14 @@ class Settings(BaseSettings):
     @property
     def elasticsearch(self) -> ElasticsearchConfig:
         """Получить конфигурацию Elasticsearch."""
-        # Формируем URL из host и port
-        es_url = f"http://{self.elasticsearch_host}:{self.elasticsearch_port}"
+        # Предпочитаем явный URL из окружения, иначе собираем из host:port
+        es_url = (self.elasticsearch_url or "").strip()
+        if not es_url:
+            es_url = f"{self.elasticsearch_host}:{self.elasticsearch_port}".strip()
+        
+        # Гарантируем наличие схемы
+        if not es_url.startswith("http://") and not es_url.startswith("https://"):
+            es_url = f"http://{es_url}"
         
         return ElasticsearchConfig(
             url=es_url,

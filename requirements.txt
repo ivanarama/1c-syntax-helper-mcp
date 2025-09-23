@@ -6,6 +6,7 @@ uvicorn[standard]==0.32.0
 
 # Elasticsearch клиент
 elasticsearch==8.16.0
+aiohttp
 
 # Парсинг данных
 pydantic==2.10.2

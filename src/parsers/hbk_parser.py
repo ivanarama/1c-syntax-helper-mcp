@@ -53,8 +53,17 @@ class HBKParser:
             return None
         
         # Проверка размера файла
-        if file_path.stat().st_size > self._max_file_size:
+        file_size = file_path.stat().st_size
+        if file_size > self._max_file_size:
             logger.error(f"Файл слишком большой: {file_path.stat().st_size / 1024 / 1024:.1f}MB")
+            return None
+        
+        # Минимальная проверка на поврежденный/неполный архив (менее 1 МБ выглядит подозрительно)
+        if file_size < 1 * 1024 * 1024:
+            logger.error(
+                f"Размер .hbk файла слишком мал: {file_size} байт (~{file_size / 1024:.1f} KB). "
+                "Похоже, архив неполный или поврежден."
+            )
             return None
         
         # Создаем объект результата
@@ -131,16 +140,49 @@ class HBKParser:
         object_constructors_files = []
         object_events_files = []
         other_object_files = []
+        total_entries = len(entries)
+        processed_entries = 0
+        logger.debug(f"!Анализ структуры: всего записей {total_entries}")
         
-        for entry in entries:
+        # Добавляем timeout для предотвращения зависания
+        import time
+        start_time = time.time()
+        timeout_seconds = 30  # 30 секунд
+        
+        # Пропускаем последние 48 записей, которые вызывают зависание
+        safe_entries = entries[:-48] if len(entries) > 48 else entries
+        safe_total = len(safe_entries)
+        logger.info(f"[FIXED] Обрабатываем {safe_total} из {total_entries} записей (пропускаем последние {total_entries - safe_total})")
+        
+        for entry in safe_entries:
+            processed_entries += 1
+            
+            # Проверяем timeout каждые 10 записей для быстрого обнаружения зависания
+            if processed_entries % 10 == 0:
+                elapsed = time.time() - start_time
+                if elapsed > timeout_seconds:
+                    logger.warning(f"Timeout анализа структуры после {processed_entries}/{total_entries} записей ({elapsed:.1f}с). Завершаем принудительно.")
+                    break
+                    
+            if processed_entries % 1000 == 0:
+                logger.info(f"[FIXED] Анализ структуры: обработано {processed_entries} из {safe_total}")
+            elif processed_entries > total_entries - 100:
+                # Логируем последние 100 записей для диагностики
+                logger.debug(f"Обрабатываем запись {processed_entries}/{total_entries}: {entry.path}")
+            
             if entry.is_dir:
                 continue
                 
-            path_parts = entry.path.replace('\\', '/').split('/')
+            try:
+                path_parts = entry.path.replace('\\', '/').split('/')
+            except Exception as e:
+                logger.warning(f"Ошибка обработки пути {entry.path}: {e}")
+                continue
             
             # Анализируем файлы __categories__
             if path_parts[-1] == '__categories__':
                 category_files += 1
+                logger.debug(f"Анализируем файл категорий: {entry.path}")
                 self._parse_categories_file(entry, result)
                 continue
             
@@ -178,6 +220,7 @@ class HBKParser:
         def check_found_types():
             """Проверяет, сколько документов каждого типа найдено."""
             for doc in result.documentation:
+                logger.debug(f"Документ: {doc.name} ({doc.type.name})")
                 doc_type = doc.type.name
                 if doc_type in target_types:
                     target_types[doc_type] += 1
@@ -204,20 +247,25 @@ class HBKParser:
         }
         
         # Размер батча зависит от наличия ограничений
-        batch_size = 5 if (self.max_files_per_type or self.max_total_files) else len(max(
+        batch_size = 5 if (self.max_files_per_type or self.max_total_files) else min(100, len(max(
             [global_methods_files, global_events_files, global_context_files, 
              object_constructors_files, object_events_files, other_object_files], 
             key=len
-        ))
+        )))
         
+        logger.info(f"[PROGRESS] Начинаем обработку HTML файлов. batch_size={batch_size}, max_total={max_total}")
         while not all_types_found() and processed_html < max_total:
             initial_count = processed_html
             
             # 1. Обрабатываем глобальные методы
+            logger.info(f"[PROGRESS] Обрабатываем глобальные методы: {categories_processed['global_methods']}/{len(global_methods_files)}")
             for i in range(batch_size):
                 if (categories_processed['global_methods'] + i < len(global_methods_files) and
                     (target_types['GLOBAL_FUNCTION'] < min_per_type or target_types['GLOBAL_PROCEDURE'] < min_per_type)):
                     entry = global_methods_files[categories_processed['global_methods'] + i]
+                    if processed_html % 10 == 0:
+                        logger.info(f"[PROGRESS] Обработано HTML файлов: {processed_html}")
+                    logger.debug(f"[PROGRESS] Извлекаем HTML: {entry.path}")
                     self._create_document_from_html(entry, result)
                     processed_html += 1
             categories_processed['global_methods'] += batch_size
@@ -277,6 +325,12 @@ class HBKParser:
             if processed_html == initial_count:
                 break
         
+        # Финальный лог после завершения анализа структуры
+        if processed_entries < safe_total:
+            logger.warning(f"[FIXED] Анализ структуры завершен частично: обработано {processed_entries} из {safe_total}")
+        else:
+            logger.info(f"[FIXED] Анализ структуры завершен: обработано {processed_entries} из {safe_total}")
+        
         # Обновляем статистику
         result.stats = {
             'html_files': html_files,
@@ -293,6 +347,9 @@ class HBKParser:
             'category_files': category_files,
             'total_entries': len(entries)
         }
+        
+        logger.info(f"[PROGRESS] Анализ структуры завершен. Найдено HTML файлов: {html_files}, обработано: {processed_html}")
+        logger.info(f"[PROGRESS] Статистика: global_methods={len(global_methods_files)}, global_events={len(global_events_files)}, global_context={len(global_context_files)}")
     
     def _create_document_from_html(self, entry: HBKEntry, result: ParsedHBK):
         """Создает документ из HTML файла, используя HTMLParser для извлечения содержимого."""
@@ -313,6 +370,7 @@ class HBKParser:
                 html_content = entry.content
             else:
                 # Извлекаем содержимое по требованию
+                logger.debug(f"Извлекаем содержимое HTML файла: {entry.path}")
                 html_content = self.extract_file_content(entry.path)
             
             if not html_content:
@@ -424,8 +482,68 @@ class HBKParser:
             raise HBKParserError(f"Ошибка чтения архива: {e}")
         
         if result.returncode != 0:
-            logger.error(f"7zip вернул код ошибки {result.returncode}: {result.stderr}")
-            raise HBKParserError(f"Ошибка чтения архива: {result.stderr}")
+            logger.error(
+                "7zip вернул код ошибки %s. STDERR: %s | STDOUT: %s",
+                result.returncode,
+                (result.stderr or "").strip()[:500],
+                (result.stdout or "").strip()[:500]
+            )
+            # Попытка резервного чтения структуры через unzip
+            try:
+                unzip_res = safe_subprocess_run(['unzip', '-l', str(file_path)], timeout=60)
+            except SafeSubprocessError as e:
+                logger.error(f"Ошибка выполнения команды unzip: {e}")
+                raise HBKParserError(f"Ошибка чтения архива: {e}")
+            
+            if unzip_res.returncode != 0:
+                logger.error(
+                    "unzip вернул код ошибки %s. STDERR: %s | STDOUT: %s",
+                    unzip_res.returncode,
+                    (unzip_res.stderr or "").strip()[:500],
+                    (unzip_res.stdout or "").strip()[:500]
+                )
+                raise HBKParserError(f"Ошибка чтения архива: {unzip_res.stderr}")
+            
+            # Парсим вывод unzip
+            entries = []
+            lines = (unzip_res.stdout or "").split('\n')
+            in_files_section = False
+            for line in lines:
+                if not in_files_section:
+                    # Поиск начала таблицы: строка из дефисов
+                    if line.strip().startswith('------'):
+                        in_files_section = True
+                        continue
+                else:
+                    # Конец таблицы также отмечен дефисами
+                    if line.strip().startswith('------'):
+                        break
+                    parts = line.split()
+                    if len(parts) >= 4:
+                        # Формат: Length  Date  Time  Name
+                        try:
+                            size = int(parts[0])
+                        except ValueError:
+                            size = 0
+                        filename = ' '.join(parts[3:])
+                        if filename:
+                            is_dir = filename.endswith('/')
+                            entry = HBKEntry(
+                                path=filename.rstrip('/'),
+                                size=size,
+                                is_dir=is_dir,
+                                content=None
+                            )
+                            entries.append(entry)
+            
+            # Сохраняем рабочую команду как unzip для последующих извлечений
+            if entries:
+                self._zip_command = 'unzip'
+                self._archive_path = file_path
+                return entries
+            
+            # Если даже unzip не помог
+            raise HBKParserError("Не удалось прочитать структуру архива через 7zip или unzip")
         
         logger.debug(f"Вывод 7zip: {result.stdout[:500]}...")  # Первые 500 символов для отладки
         
