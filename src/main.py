@@ -1,12 +1,14 @@
 """Главное приложение MCP сервера синтаксис-помощника 1С."""
 
 import json
+import sys
 import asyncio
 import time
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from src.core.config import settings
 from src.core.logging import get_logger
@@ -166,11 +168,38 @@ async def rate_limit_middleware(request: Request, call_next):
     """Middleware для ограничения скорости запросов."""
     rate_limiter = get_rate_limiter()
     metrics = get_metrics_collector()
-    
+    logger.info("rate_limit_middleware")
     # Получаем IP клиента
     client_ip = request.client.host if request.client else "unknown"
     
     try:
+        # Глобальный отладочный принт для любого запроса (для уверенности)
+        try:
+            print(f"[DEBUG] middleware start path={request.url.path} method={request.method}")
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Временный консольный лог для диагностики проблемного 400 на /mcp
+        if request.url.path == "/mcp":
+            try:
+                body_bytes = await request.body()
+                body_preview = body_bytes.decode("utf-8", errors="replace")
+                if len(body_preview) > 2000:
+                    body_preview = body_preview[:2000] + "...<truncated>"
+                print(f"[DEBUG]/mcp middleware ip={client_ip} ct={request.headers.get('content-type','')} cl={request.headers.get('content-length','')} body={body_preview}")
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+            except Exception as _e:
+                print(f"[DEBUG]/mcp middleware failed to read body: {_e}")
+                try:
+                    sys.stdout.flush()
+                except Exception:
+                    pass
         # Проверяем rate limit
         await rate_limiter.check_rate_limit(client_ip)
         
@@ -257,16 +286,33 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    """Логируем любые HTTP ошибки (включая 400), возникающие до/вне наших обработчиков."""
+    logger.error(f"HTTPException {exc.status_code} at {request.url}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.status_code,
+                "message": str(exc.detail) if exc.detail else "HTTP error"
+            }
+        }
+    )
+
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Проверка состояния системы."""
+    logger.info("health_check")
+    """Проверка состояния системы.
+
+    Важно: не считаем сервер «нездоровым», если недоступен Elasticsearch.
+    Это позволяет клиентам (например, Cursor) успешно проходить проверку
+    работоспособности MCP сервера даже без внешних зависимостей.
+    """
     metrics = get_metrics_collector()
     
     async with metrics.timer("health_check.duration"):
-        # Подключаемся к Elasticsearch если еще не подключены
-        if not await es_client.is_connected():
-            await es_client.connect()
-        
+        # Не инициируем подключение к Elasticsearch в health-check, только проверяем текущее состояние
         es_connected = await es_client.is_connected()
         index_exists_response = await es_client.index_exists() if es_connected else False
         index_exists = bool(index_exists_response) if index_exists_response else False
@@ -275,12 +321,14 @@ async def health_check():
     await metrics.increment("health_check.requests")
     
     return HealthResponse(
-        status="healthy" if es_connected else "unhealthy",
+        status="healthy",  # сервер доступен и готов принимать MCP-запросы
         elasticsearch=es_connected,
         index_exists=index_exists,
         documents_count=docs_count
     )
-
+@app.get("/")
+async def root(request: Request) -> JSONResponse:
+    return JSONResponse({"message": "MCP 1C Metadata Server запущен"})
 
 @app.get("/index/status")
 async def index_status():
@@ -358,6 +406,7 @@ async def rebuild_index():
 
 @app.get("/mcp/tools", response_model=MCPToolsResponse)
 async def get_mcp_tools():
+    logger.info("get_mcp_tools")
     """Возвращает список доступных MCP инструментов."""
     tools = [
         MCPTool(
@@ -481,6 +530,7 @@ async def get_mcp_tools():
 
 @app.get("/mcp")
 async def mcp_sse_endpoint():
+    logger.info("mcp_sse_endpoint")
     """MCP Server-Sent Events endpoint для потокового соединения."""
     from fastapi.responses import StreamingResponse
     
@@ -510,16 +560,129 @@ async def mcp_jsonrpc_endpoint(request: Request):
     import json
     
     try:
+        # Подтверждаем достижение обработчика /mcp до чтения тела
+        try:
+            print("[DEBUG] entered /mcp handler")
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+        except Exception:
+            pass
         body = await request.body()
+        try:
+            print(f"[DEBUG] /mcp handler body_len={len(body)}")
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Временное логирование проблемных запросов на /mcp
+        try:
+            client_ip = request.client.host if request.client else "unknown"
+            content_type = request.headers.get("content-type", "")
+            content_length = request.headers.get("content-length", "")
+            raw_text = body.decode("utf-8", errors="replace")
+            preview_limit = 3000
+            preview = raw_text if len(raw_text) <= preview_limit else raw_text[:preview_limit] + "...<truncated>"
+            logger.info(
+                f"/mcp request debug | ip={client_ip} | ct={content_type} | cl={content_length} | body_preview={preview}"
+            )
+        except Exception as _log_err:
+            logger.warning(f"Не удалось залогировать тело запроса /mcp: {_log_err}")
         data = json.loads(body.decode('utf-8'))
-        
+
+        # Поддержка batch запросов JSON-RPC
+        if isinstance(data, list):
+            # Пустой массив — некорректный JSON-RPC запрос
+            if len(data) == 0:
+                return JSONResponse(content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Invalid Request"}
+                })
+            results = []
+            for item in data:
+                if not isinstance(item, dict) or item.get("jsonrpc") != "2.0":
+                    results.append({
+                        "jsonrpc": "2.0",
+                        "id": item.get("id") if isinstance(item, dict) else None,
+                        "error": {"code": -32600, "message": "Invalid Request"}
+                    })
+                    continue
+                method = item.get("method")
+                params = item.get("params", {})
+                request_id = item.get("id")
+                # Рекурсивно обрабатываем как одиночный запрос через внутреннюю логіку
+                # Для простоты и прозрачности повторим основные ветки здесь
+                if method == "initialize":
+                    results.append({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {
+                                "tools": {},
+                                "resources": {},
+                                "prompts": {},
+                                "roots": {"listChanged": False},
+                                "sampling": {}
+                            },
+                            "serverInfo": {"name": "1c-syntax-helper-mcp", "version": "1.0.0"}
+                        }
+                    })
+                elif method == "tools/list":
+                    tools_response = await get_mcp_tools()
+                    results.append({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"tools": [
+                            {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {param.name: {"type": param.type, "description": param.description} for param in tool.parameters},
+                                    "required": [param.name for param in tool.parameters if param.required]
+                                }
+                            } for tool in tools_response.tools
+                        ]}
+                    })
+                elif method == "prompts/list":
+                    results.append({"jsonrpc": "2.0", "id": request_id, "result": {"prompts": []}})
+                elif method == "prompts/get":
+                    results.append({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Prompt not found"}})
+                elif method == "notifications/initialized":
+                    # В batch режиме JSON-RPC уведомления не возвращают результата, добавим пустой
+                    results.append({"jsonrpc": "2.0", "id": request_id, "result": {}})
+                elif method == "resources/list":
+                    results.append({"jsonrpc": "2.0", "id": request_id, "result": {"resources": []}})
+                elif method == "resources/read":
+                    results.append({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32004, "message": "Resource not found"}})
+                elif method == "roots/list":
+                    results.append({"jsonrpc": "2.0", "id": request_id, "result": {"roots": []}})
+                elif method == "sampling/create" or method == "sampling/complete":
+                    results.append({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Sampling not supported"}})
+                elif method == "tools/call":
+                    from src.models.mcp_models import MCPRequest
+                    mcp_request = MCPRequest(tool=params.get("name"), arguments=params.get("arguments", {}))
+                    result = await mcp_endpoint_handler(mcp_request)
+                    results.append({
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"content": result.content if hasattr(result, 'content') else result, "isError": False}
+                    })
+                else:
+                    results.append({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"Method not found: {method}"}})
+            return JSONResponse(content=results)
+
+        # Обычный одиночный запрос
         # Проверяем JSON-RPC формат
         if data.get("jsonrpc") != "2.0":
-            return JSONResponse(
-                status_code=400,
-                content={"error": {"code": -32600, "message": "Invalid Request"}}
-            )
-        
+            return JSONResponse(content={"jsonrpc": "2.0", "id": data.get("id"), "error": {"code": -32600, "message": "Invalid Request"}})
+
         method = data.get("method")
         params = data.get("params", {})
         request_id = data.get("id")
@@ -530,7 +693,7 @@ async def mcp_jsonrpc_endpoint(request: Request):
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": "2024-11-05",
                     "capabilities": {
                         "tools": {},
                         "resources": {},
@@ -583,9 +746,63 @@ async def mcp_jsonrpc_endpoint(request: Request):
                 }
             })
         
+        # Обрабатываем prompts/get запрос (пока нет предопределенных промптов)
+        elif method == "prompts/get":
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": "Prompt not found"}
+            })
+        
         # Обрабатываем notifications/initialized (без ответа)
         elif method == "notifications/initialized":
-            return JSONResponse(content={"status": "ok"})
+            # Возвращаем 200 с пустым результатом, чтобы избежать неверной
+            # интерпретации 204 некоторыми клиентами
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {}
+            })
+        
+        # Обрабатываем resources/list
+        elif method == "resources/list":
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"resources": []}
+            })
+        
+        # Обрабатываем resources/read
+        elif method == "resources/read":
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32004, "message": "Resource not found"}
+            })
+        
+        # Обрабатываем roots/list
+        elif method == "roots/list":
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"roots": []}
+            })
+        
+        # Обрабатываем sampling/create (не поддерживается)
+        elif method == "sampling/create":
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": "Sampling not supported"}
+            })
+        
+        # Обрабатываем sampling/complete (не поддерживается)
+        elif method == "sampling/complete":
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": "Sampling not supported"}
+            })
         
         # Обрабатываем tools/call запрос
         elif method == "tools/call":
@@ -609,20 +826,14 @@ async def mcp_jsonrpc_endpoint(request: Request):
             })
         
         else:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "error": {"code": -32601, "message": f"Method not found: {method}"}
-                }
-            )
+            return JSONResponse(content={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": f"Method not found: {method}"}
+            })
             
     except json.JSONDecodeError:
-        return JSONResponse(
-            status_code=400,
-            content={"error": {"code": -32700, "message": "Parse error"}}
-        )
+        return JSONResponse(content={"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
     except Exception as e:
         logger.error(f"Ошибка в MCP JSON-RPC endpoint: {e}")
         return JSONResponse(
@@ -659,14 +870,243 @@ async def mcp_endpoint_handler(request: MCPRequest):
         elif request.tool == MCPToolType.LIST_OBJECT_MEMBERS:
             return await handle_list_object_members(ListObjectMembersRequest(**request.arguments))
         else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Неизвестный инструмент: {request.tool}"
-            )
+            return MCPResponse(content=[], error=f"Неизвестный инструмент: {request.tool}")
             
     except Exception as e:
         logger.error(f"Ошибка обработки MCP запроса: {e}")
         return MCPResponse(content=[], error=str(e))
+
+
+@app.websocket("/mcp/ws")
+async def mcp_websocket_endpoint(websocket: WebSocket):
+    """MCP WebSocket endpoint для обработки MCP протокола через WebSocket."""
+    logger.info("WebSocket connection initiated")
+    
+    await websocket.accept()
+    
+    try:
+        # Отправляем начальное событие подключения
+        await websocket.send_json({
+            "type": "connection", 
+            "status": "connected",
+            "timestamp": int(time.time())
+        })
+        
+        while True:
+            try:
+                # Получаем сообщение от клиента
+                message = await websocket.receive_json()
+                logger.info(f"Получено WebSocket сообщение: {json.dumps(message, ensure_ascii=False)}")
+                
+                # Обрабатываем JSON-RPC запрос
+                response = await process_jsonrpc_message(message)
+                
+                # Отправляем ответ
+                await websocket.send_json(response)
+                
+            except WebSocketDisconnect:
+                logger.info("WebSocket клиент отключился")
+                break
+            except json.JSONDecodeError:
+                # Отправляем ошибку парсинга JSON
+                error_response = {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Parse error"}
+                }
+                await websocket.send_json(error_response)
+            except Exception as e:
+                logger.error(f"Ошибка в WebSocket обработчике: {e}")
+                error_response = {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id") if isinstance(message, dict) else None,
+                    "error": {"code": -32603, "message": f"Internal error: {str(e)}"}
+                }
+                await websocket.send_json(error_response)
+                
+    except Exception as e:
+        logger.error(f"Критическая ошибка WebSocket соединения: {e}")
+    finally:
+        logger.info("WebSocket соединение закрыто")
+
+
+async def process_jsonrpc_message(data):
+    """Обрабатывает JSON-RPC сообщение (переиспользует логику из HTTP endpoint)."""
+    # Поддержка batch запросов JSON-RPC
+    if isinstance(data, list):
+        # Пустой массив — некорректный JSON-RPC запрос
+        if len(data) == 0:
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600, "message": "Invalid Request"}
+            }
+        
+        results = []
+        for item in data:
+            result = await process_single_jsonrpc_message(item)
+            results.append(result)
+        return results
+    else:
+        # Обычный одиночный запрос
+        return await process_single_jsonrpc_message(data)
+
+
+async def process_single_jsonrpc_message(data):
+    """Обрабатывает одиночное JSON-RPC сообщение."""
+    if not isinstance(data, dict) or data.get("jsonrpc") != "2.0":
+        return {
+            "jsonrpc": "2.0",
+            "id": data.get("id") if isinstance(data, dict) else None,
+            "error": {"code": -32600, "message": "Invalid Request"}
+        }
+
+    method = data.get("method")
+    params = data.get("params", {})
+    request_id = data.get("id")
+    
+    # Обрабатываем initialize запрос
+    if method == "initialize":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {},
+                    "resources": {},
+                    "prompts": {},
+                    "roots": {"listChanged": False},
+                    "sampling": {}
+                },
+                "serverInfo": {
+                    "name": "1c-syntax-helper-mcp",
+                    "version": "1.0.0"
+                }
+            }
+        }
+    
+    # Обрабатываем tools/list запрос
+    elif method == "tools/list":
+        tools_response = await get_mcp_tools()
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                param.name: {
+                                    "type": param.type,
+                                    "description": param.description
+                                }
+                                for param in tool.parameters
+                            },
+                            "required": [param.name for param in tool.parameters if param.required]
+                        }
+                    }
+                    for tool in tools_response.tools
+                ]
+            }
+        }
+    
+    # Обрабатываем prompts/list запрос
+    elif method == "prompts/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "prompts": []
+            }
+        }
+    
+    # Обрабатываем prompts/get запрос
+    elif method == "prompts/get":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Prompt not found"}
+        }
+    
+    # Обрабатываем notifications/initialized
+    elif method == "notifications/initialized":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {}
+        }
+    
+    # Обрабатываем resources/list
+    elif method == "resources/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"resources": []}
+        }
+    
+    # Обрабатываем resources/read
+    elif method == "resources/read":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32004, "message": "Resource not found"}
+        }
+    
+    # Обрабатываем roots/list
+    elif method == "roots/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"roots": []}
+        }
+    
+    # Обрабатываем sampling/create
+    elif method == "sampling/create":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Sampling not supported"}
+        }
+    
+    # Обрабатываем sampling/complete
+    elif method == "sampling/complete":
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": "Sampling not supported"}
+        }
+    
+    # Обрабатываем tools/call запрос
+    elif method == "tools/call":
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+        
+        # Преобразуем в наш формат MCPRequest
+        from src.models.mcp_models import MCPRequest
+        mcp_request = MCPRequest(tool=tool_name, arguments=arguments)
+        
+        # Вызываем наш существующий обработчик
+        result = await mcp_endpoint_handler(mcp_request)
+        
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "content": result.content if hasattr(result, 'content') else result,
+                "isError": False
+            }
+        }
+    
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        }
 
 
 @app.get("/metrics")
