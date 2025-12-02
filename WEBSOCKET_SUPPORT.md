@@ -8,7 +8,7 @@
 
 ### WebSocket Endpoint
 
-- **URL**: `ws://localhost:8000/mcp/ws`
+- **URL**: `ws://localhost:8000/mcp/ws` (или `ws://localhost:8002/mcp/ws` если используется Docker с маппингом портов)
 - **Протокол**: JSON-RPC 2.0 через WebSocket
 - **Поддержка**: Полная совместимость с MCP протоколом
 

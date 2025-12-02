@@ -145,6 +145,30 @@ Command Palette → MCP: Show Logs
 
 ## Устранение неполадок
 
+### Проблема: "MCP работает в Cursor, но не работает в VS Code"
+
+**Причина:** Конфликт конфигураций между Cursor и VS Code.
+
+**Решение:**
+1. Отключите MCP Discovery в VS Code:
+   ```json
+   {
+     "mcp.discovery.enabled": false
+   }
+   ```
+
+2. Создайте отдельную конфигурацию для VS Code:
+   - macOS: `~/Library/Application Support/Code/User/mcp.json`
+   - Windows: `%APPDATA%\Code\User\mcp.json`
+   - Linux: `~/.config/Code/User/mcp.json`
+
+3. Запустите диагностический скрипт:
+   ```bash
+   python3 diagnose_mcp.py
+   ```
+
+Подробнее см. `VS_CODE_CURSOR_MCP_FIX.md`
+
 ### Проблема: "Server not found"
 
 **Решение:**

@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "my-1c-mcp-server": {
+      "url": "http://192.168.1.13:8012/sse",
+      "timeout": 60,
+      "headers": {
+        "x-collection-name": "1cservice_rag"
+      },
+      "disabled": false,
+      "alwaysAllow": []
+    },
+    "1c-syntax-helper": {
+      "url": "http://localhost:8003/mcp",
+      "timeout": 60,
+      "disabled": false,
+      "alwaysAllow": []
+    }
+  }
+}
